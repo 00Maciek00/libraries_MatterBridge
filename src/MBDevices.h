@@ -28,6 +28,34 @@
 #include "MBDevice.h"
 
 // ============================================================
+//  MBDevices.h – all Matter device types
+//
+//  RULES (apply to every class):
+//
+//  1. _buildEndpoint() checks the result of EVERY create().
+//     If any create() returns nullptr → return nullptr.
+//     No check = a "dead" device in the hub with no error message.
+//
+//  2. _addBridgedBasicInfo(ep) returns bool.
+//     Call: if (!_addBridgedBasicInfo(ep)) return nullptr;
+//
+//  3. feature::add() is called AFTER the cluster's create() (as in MBSwitch).
+//     Do NOT set features before create() – unstable in esp-matter 3.3.x.
+//
+//  4. applyState() → ONLY updates _attrs + reportAttribute().
+//     It does not call esp_matter::attribute::set_val() directly.
+//
+//  5. onAttrRead() → returns the value from _attrs.
+//     The stack calls this callback on every read.
+//
+//  6. [FIX] Every _buildEndpoint() finishes with
+//     esp_matter::endpoint::add_device_type(ep, DEVICE_TYPE_ID, 1)
+//     using the proper DeviceType ID per the Matter spec.
+//     Without it the hub sees a "Bridged Node" (0x0013) instead of the right type.
+//
+//  7. [FIX] onAttrRead() handles FeatureMap (0xFFFC) and
+//     ClusterRevision (0xFFFD) for every cluster – required by the spec.
+//
 //  MBDevices.h – wszystkie typy urządzeń Matter
 //
 //  ZASADY (obowiązują każdą klasę):
@@ -58,16 +86,16 @@
 // ============================================================
 
 // ============================================================
-//  ── CZUJNIKI PASYWNE ──────────────────────────────────────
+//  ── PASSIVE SENSORS / CZUJNIKI PASYWNE ──────────────────────────────────────
 // ============================================================
 
 // ============================================================
 //  MBContactSensor
 //  Matter: Contact Sensor (0x0015)
 //  Cluster: BooleanState – StateValue (bool)
-//  Użycie:
-//    MatterBridge.setState(slot, true);   // kontakt zamknięty
-//    MatterBridge.setState(slot, false);  // kontakt otwarty
+//  Usage / Użycie:
+//    MatterBridge.setState(slot, true);   // contact closed / kontakt zamknięty
+//    MatterBridge.setState(slot, false);  // contact open / kontakt otwarty
 // ============================================================
 class MBContactSensor final : public MBDevice {
 public:
@@ -89,7 +117,7 @@ public:
       if (aId == BooleanState::Attributes::StateValue::Id) {
         *val = esp_matter_bool(_attrs.boolState); return ESP_OK;
       }
-      // FeatureMap: BooleanState nie ma zdefiniowanych feature'ów → 0
+      // FeatureMap: BooleanState has no defined features → 0 / nie ma zdefiniowanych feature'ów
       if (aId == 0xFFFC) { *val = esp_matter_uint32(0); return ESP_OK; }
       // ClusterRevision: BooleanState rev 1
       if (aId == 0xFFFD) { *val = esp_matter_uint16(1); return ESP_OK; }
@@ -117,7 +145,9 @@ protected:
 
     if (!_addBridgedBasicInfo(ep)) return nullptr;
 
+    // FIX: set the correct DeviceType ID – Contact Sensor (0x0015)
     // POPRAWKA: ustaw właściwy DeviceType ID – Contact Sensor (0x0015)
+    // Without it the hub sees "Bridged Node" instead of "Contact Sensor"
     // Bez tego hub widzi "Bridged Node" zamiast "Contact Sensor"
     esp_matter::endpoint::add_device_type(ep, 0x0015, 1);
 
@@ -129,6 +159,7 @@ protected:
 //  MBPresenceSensor
 //  Matter: Occupancy Sensor (0x0107)
 //  Cluster: OccupancySensing – Occupancy (bitmap8)
+//  Feature: PassiveInfrared (PIR) – added AFTER the cluster's create()
 //  Feature: PassiveInfrared (PIR) – dodawana PO create() klastra
 // ============================================================
 class MBPresenceSensor final : public MBDevice {
@@ -184,6 +215,10 @@ protected:
       ep, &oCfg, CLUSTER_FLAG_SERVER);
     if (!oc) { ESP_LOGE("PresenceSensor", "occupancy_sensing create failed"); return nullptr; }
 
+    // NOTE: in esp32c6-libs 3.3.6 passive_infrared has no config_t –
+    // add() takes only a pointer to the cluster (no configuration struct).
+    // The PIR delay attributes (PIROccupiedToUnoccupiedDelay etc.) are handled
+    // by onAttrRead() above, where FeatureMap returns bit0=1 (PIR).
     // UWAGA: W esp32c6-libs 3.3.6 passive_infrared nie ma config_t –
     // add() przyjmuje wyłącznie wskaźnik na klaster (bez struktury konfiguracji).
     // Atrybuty opóźnień PIR (PIROccupiedToUnoccupiedDelay itp.) obsługiwane są
@@ -202,17 +237,20 @@ protected:
 // ============================================================
 //  MBSwitch
 //  Matter: Generic Switch (0x000F) – momentary
+//  Cluster: Switch with features MS + MSR + MSLP + MSMP
 //  Cluster: Switch z feature MS + MSR + MSLP + MSMP
 //
+//  Interactions:
 //  Interakcje:
 //    applyState(true/false)  → InitialPress / ShortRelease
-//    sendMultiPress(n)       → MultiPressComplete (n=1/2/3 kliknięć)
+//    sendMultiPress(n)       → MultiPressComplete (n=1/2/3 clicks / kliknięć)
 //    sendLongPress()         → LongPress
 //    sendLongRelease()       → LongRelease
 //
+//  Access to type-specific methods:
 //  Dostęp do metod specyficznych:
 //    auto* sw = static_cast<MBSwitch*>(MatterBridge.device(slot));
-//    sw->sendMultiPress(2);   // dwuklik
+//    sw->sendMultiPress(2);   // double click / dwuklik
 // ============================================================
 class MBSwitch final : public MBDevice {
 public:
@@ -222,6 +260,9 @@ public:
   void applyState(bool state) override {
     _attrs.switchPosition = state ? 1 : 0;
     if (_endpointId == 0) return;
+    // FIX: chip_stack_lock is required when sending switch events
+    // from loop() context – without the lock a race with the Matter thread
+    // corrupts the stack's internal structures (heap corruption / reboots).
     // POPRAWKA: chip_stack_lock wymagany przy wysyłaniu zdarzeń switch
     // z kontekstu loop() – bez locka wyścig z wątkiem Matter powoduje
     // korupcję wewnętrznych struktur stosu (heap corruption / restarty).
@@ -275,6 +316,8 @@ public:
       if (aId == Attributes::MultiPressMax::Id) {
         *val = esp_matter_uint8(3); return ESP_OK;
       }
+      // FeatureMap: the stack manages this automatically via feature::add(),
+      // but we return it explicitly to be safe.
       // FeatureMap: stos zarządza tym automatycznie przez feature::add(),
       // ale zwracamy jawnie dla pewności.
       // MS=bit0, MSR=bit1, MSLP=bit2, MSMP=bit3 → 0x0F
@@ -303,6 +346,7 @@ protected:
       ep, &sCfg, CLUSTER_FLAG_SERVER);
     if (!swCl) { ESP_LOGE("Switch", "switch_cluster create failed"); return nullptr; }
 
+    // Features in the required order (Matter spec §1.11.4 dependencies):
     // Features w wymaganej kolejności (zależności spec Matter §1.11.4):
     //   MS → MSR → MSLP → MSMP
     esp_matter::cluster::switch_cluster::feature::momentary_switch::add(swCl);
@@ -314,6 +358,7 @@ protected:
 
     if (!_addBridgedBasicInfo(ep)) return nullptr;
 
+    // FIX: set the correct DeviceType ID – Generic Switch (0x000F)
     // POPRAWKA: ustaw właściwy DeviceType ID – Generic Switch (0x000F)
     esp_matter::endpoint::add_device_type(ep, 0x000F, 1);
 
@@ -325,7 +370,7 @@ protected:
 //  MBTemperatureSensor
 //  Matter: Temperature Sensor (0x0302)
 //  Cluster: TemperatureMeasurement – MeasuredValue (int16 ×100)
-//  Użycie:
+//  Usage / Użycie:
 //    auto* t = static_cast<MBTemperatureSensor*>(MatterBridge.device(slot));
 //    t->setTemperature(21.5f);   // 21.5°C
 // ============================================================
@@ -358,7 +403,7 @@ public:
       if (aId == TemperatureMeasurement::Attributes::MaxMeasuredValue::Id) {
         *val = esp_matter_int16(10000); return ESP_OK;
       }
-      // FeatureMap: TemperatureMeasurement nie ma feature'ów → 0
+      // FeatureMap: TemperatureMeasurement has no features → 0 / nie ma feature'ów
       if (aId == 0xFFFC) { *val = esp_matter_uint32(0); return ESP_OK; }
       // ClusterRevision: TemperatureMeasurement rev 4
       if (aId == 0xFFFD) { *val = esp_matter_uint16(4); return ESP_OK; }
@@ -387,6 +432,7 @@ protected:
 
     if (!_addBridgedBasicInfo(ep)) return nullptr;
 
+    // FIX: set the correct DeviceType ID – Temperature Sensor (0x0302)
     // POPRAWKA: ustaw właściwy DeviceType ID – Temperature Sensor (0x0302)
     esp_matter::endpoint::add_device_type(ep, 0x0302, 1);
 
@@ -398,7 +444,7 @@ protected:
 //  MBHumiditySensor
 //  Matter: Humidity Sensor (0x0307)
 //  Cluster: RelativeHumidityMeasurement – MeasuredValue (uint16 ×100)
-//  Użycie:
+//  Usage / Użycie:
 //    auto* h = static_cast<MBHumiditySensor*>(MatterBridge.device(slot));
 //    h->setHumidity(55.0f);   // 55%RH
 // ============================================================
@@ -431,7 +477,7 @@ public:
       if (aId == RelativeHumidityMeasurement::Attributes::MaxMeasuredValue::Id) {
         *val = esp_matter_uint16(10000); return ESP_OK;
       }
-      // FeatureMap: RelativeHumidityMeasurement nie ma feature'ów → 0
+      // FeatureMap: RelativeHumidityMeasurement has no features → 0 / nie ma feature'ów
       if (aId == 0xFFFC) { *val = esp_matter_uint32(0); return ESP_OK; }
       // ClusterRevision: RelativeHumidityMeasurement rev 3
       if (aId == 0xFFFD) { *val = esp_matter_uint16(3); return ESP_OK; }
@@ -460,6 +506,7 @@ protected:
 
     if (!_addBridgedBasicInfo(ep)) return nullptr;
 
+    // FIX: set the correct DeviceType ID – Humidity Sensor (0x0307)
     // POPRAWKA: ustaw właściwy DeviceType ID – Humidity Sensor (0x0307)
     esp_matter::endpoint::add_device_type(ep, 0x0307, 1);
 
@@ -468,15 +515,19 @@ protected:
 };
 
 // ============================================================
-//  ── STEROWANIE (hub wysyła komendy) ───────────────────────
+//  ── CONTROL (hub sends commands) / STEROWANIE (hub wysyła komendy) ───────────────────────
 // ============================================================
 
 // ============================================================
 //  MBOnOffLight
 //  Matter: On/Off Light (0x0100)
 //  Cluster: OnOff z feature Lighting (LT)
+//  Callback invoked when the hub changes the state.
 //  Callback wywołany gdy hub zmienia stan.
 //
+//  NOTE: The class is marked final – do NOT inherit from it.
+//  For plugs use MBOnOffPlug (a separate class, different OnOff
+//  cluster configuration without the Lighting feature).
 //  UWAGA: Klasa jest oznaczona jako final – NIE dziedzicz po niej.
 //  Do gniazdek używaj MBOnOffPlug (osobna klasa, inna konfiguracja
 //  klastra OnOff bez feature Lighting).
@@ -501,7 +552,7 @@ public:
       if (aId == OnOff::Attributes::OnOff::Id) {
         *val = esp_matter_bool(_attrs.onOff); return ESP_OK;
       }
-      // FeatureMap: OnOff z feature Lighting (LT) = bit0 → 1
+      // FeatureMap: OnOff with the Lighting (LT) feature = bit0 → 1 / z feature Lighting (LT)
       if (aId == 0xFFFC) { *val = esp_matter_uint32(1); return ESP_OK; }
       // ClusterRevision: OnOff rev 4
       if (aId == 0xFFFD) { *val = esp_matter_uint16(4); return ESP_OK; }
@@ -534,6 +585,7 @@ protected:
 
     esp_matter::cluster::on_off::config_t oCfg = {};
     oCfg.on_off = false;
+    // SDK 3.3.6: on_off for lighting requires the LT (Lighting) feature
     // SDK 3.3.6: on_off dla oświetlenia wymaga feature LT (Lighting)
     auto* oo = esp_matter::cluster::on_off::create(
       ep, &oCfg, CLUSTER_FLAG_SERVER | CLUSTER_FLAG_ATTRIBUTE_CHANGED_FUNCTION,
@@ -542,6 +594,7 @@ protected:
 
     if (!_addBridgedBasicInfo(ep)) return nullptr;
 
+    // FIX: set the correct DeviceType ID – On/Off Light (0x0100)
     // POPRAWKA: ustaw właściwy DeviceType ID – On/Off Light (0x0100)
     esp_matter::endpoint::add_device_type(ep, 0x0100, 1);
 
@@ -552,7 +605,22 @@ protected:
 // ============================================================
 //  MBOnOffPlug
 //  Matter: On/Off Plug-in Unit (0x010A)
+//  The hub shows a plug icon instead of a light bulb.
 //  Hub wyświetla ikonę gniazdka zamiast żarówki.
+//
+//  FIX v2: A standalone class inheriting directly from MBDevice,
+//  NOT from MBOnOffLight. The previous version inherited from MBOnOffLight,
+//  which caused:
+//    - MBOnOffLight's _buildEndpoint() created the OnOff cluster with the
+//      Lighting feature (LT, FeatureMap bit0=1) and CLUSTER_FLAG_ATTRIBUTE_CHANGED_FUNCTION,
+//      even though _buildEndpoint() was overridden in MBOnOffPlug – in edge cases
+//      the compiler could call the base version through the vtable.
+//    - Inconsistency: onAttrRead() returned FeatureMap=0, but the Matter stack had
+//      registered a cluster with FeatureMap=1 → corrupt heap when queried.
+//    - The SmartThings hub saw the device as a dimmable light bulb.
+//
+//  Now the OnOff cluster is created WITHOUT the Lighting feature and WITHOUT
+//  CLUSTER_FLAG_ATTRIBUTE_CHANGED_FUNCTION – only CLUSTER_FLAG_SERVER.
 //
 //  POPRAWKA v2: Samodzielna klasa dziedzicząca bezpośrednio po MBDevice,
 //  NIE po MBOnOffLight. Poprzednia wersja dziedziczyła po MBOnOffLight,
@@ -588,7 +656,7 @@ public:
       if (aId == OnOff::Attributes::OnOff::Id) {
         *val = esp_matter_bool(_attrs.onOff); return ESP_OK;
       }
-      // OnOffPlug NIE ma feature Lighting → FeatureMap = 0
+      // OnOffPlug has NO Lighting feature → FeatureMap = 0 / NIE ma feature Lighting
       if (aId == 0xFFFC) { *val = esp_matter_uint32(0); return ESP_OK; }
       // ClusterRevision: OnOff rev 4
       if (aId == 0xFFFD) { *val = esp_matter_uint16(4); return ESP_OK; }
@@ -621,6 +689,9 @@ protected:
 
     esp_matter::cluster::on_off::config_t oCfg = {};
     oCfg.on_off = false;
+    // KEY: feature = 0 (no Lighting), CLUSTER_FLAG_SERVER only.
+    // We do not use CLUSTER_FLAG_ATTRIBUTE_CHANGED_FUNCTION – state changes
+    // arrive through the global attribute callback in MBNode.
     // KLUCZOWE: feature = 0 (brak Lighting), tylko CLUSTER_FLAG_SERVER.
     // Nie używamy CLUSTER_FLAG_ATTRIBUTE_CHANGED_FUNCTION – zmiany stanu
     // trafiają przez globalny callback atrybutów w MBNode.
@@ -640,10 +711,10 @@ protected:
 // ============================================================
 //  MBDimmableLight
 //  Matter: Dimmable Light (0x0101)
-//  Klastry: OnOff + LevelControl
-//  Użycie:
+//  Clusters / Klastry: OnOff + LevelControl
+//  Usage / Użycie:
 //    auto* d = static_cast<MBDimmableLight*>(MatterBridge.device(slot));
-//    d->setLevel(128);   // 50% jasności
+//    d->setLevel(128);   // 50% brightness / jasności
 // ============================================================
 class MBDimmableLight final : public MBDevice {
 public:
@@ -681,7 +752,7 @@ public:
       if (aId == OnOff::Attributes::OnOff::Id) {
         *val = esp_matter_bool(_attrs.onOff); return ESP_OK;
       }
-      // OnOff z feature Lighting → FeatureMap bit0 = 1
+      // OnOff with the Lighting feature → FeatureMap bit0 = 1 / z feature Lighting
       if (aId == 0xFFFC) { *val = esp_matter_uint32(1); return ESP_OK; }
       if (aId == 0xFFFD) { *val = esp_matter_uint16(4); return ESP_OK; }
     }
@@ -695,7 +766,7 @@ public:
       if (aId == LevelControl::Attributes::MaxLevel::Id) {
         *val = esp_matter_uint8(254); return ESP_OK;
       }
-      // LevelControl z feature Lighting (LT) = bit2 → 4
+      // LevelControl with the Lighting (LT) feature = bit2 → 4 / z feature Lighting (LT)
       if (aId == 0xFFFC) { *val = esp_matter_uint32(4); return ESP_OK; }
       if (aId == 0xFFFD) { *val = esp_matter_uint16(5); return ESP_OK; }
     }
@@ -749,6 +820,7 @@ protected:
 
     if (!_addBridgedBasicInfo(ep)) return nullptr;
 
+    // FIX: set the correct DeviceType ID – Dimmable Light (0x0101)
     // POPRAWKA: ustaw właściwy DeviceType ID – Dimmable Light (0x0101)
     esp_matter::endpoint::add_device_type(ep, 0x0101, 1);
 
@@ -759,10 +831,10 @@ protected:
 // ============================================================
 //  MBColorTempLight
 //  Matter: Color Temperature Light (0x010C)
-//  Klastry: OnOff + LevelControl + ColorControl (CT mode)
-//  Użycie:
+//  Clusters / Klastry: OnOff + LevelControl + ColorControl (CT mode)
+//  Usage / Użycie:
 //    auto* c = static_cast<MBColorTempLight*>(MatterBridge.device(slot));
-//    c->setColorTemp(370);   // ~2700K (ciepła biel)
+//    c->setColorTemp(370);   // ~2700K (warm white / ciepła biel)
 // ============================================================
 class MBColorTempLight final : public MBDevice {
 public:
@@ -831,7 +903,7 @@ public:
       if (aId == ColorControl::Attributes::ColorTempPhysicalMaxMireds::Id) {
         *val = esp_matter_uint16(500); return ESP_OK;  // ~2000K
       }
-      // FeatureMap: ColorControl z feature CT (ColorTemperature) = bit4 → 0x10
+      // FeatureMap: ColorControl with the CT (ColorTemperature) feature = bit4 → 0x10 / z feature CT
       if (aId == 0xFFFC) { *val = esp_matter_uint32(0x10); return ESP_OK; }
       // ClusterRevision: ColorControl rev 5
       if (aId == 0xFFFD) { *val = esp_matter_uint16(5); return ESP_OK; }
@@ -895,6 +967,7 @@ protected:
 
     if (!_addBridgedBasicInfo(ep)) return nullptr;
 
+    // FIX: set the correct DeviceType ID – Color Temperature Light (0x010C)
     // POPRAWKA: ustaw właściwy DeviceType ID – Color Temperature Light (0x010C)
     esp_matter::endpoint::add_device_type(ep, 0x010C, 1);
 
@@ -906,7 +979,7 @@ protected:
 //  MBFan
 //  Matter: Fan (0x002B)
 //  Cluster: FanControl – FanMode (0=off,1=low,2=med,3=high,4=on,5=auto)
-//  Użycie:
+//  Usage / Użycie:
 //    auto* f = static_cast<MBFan*>(MatterBridge.device(slot));
 //    f->setFanMode(2);   // medium
 // ============================================================
@@ -941,7 +1014,7 @@ public:
       if (aId == FanControl::Attributes::FanModeSequence::Id) {
         *val = esp_matter_enum8(2); return ESP_OK;  // 2 = OffLowMedHighAuto
       }
-      // FeatureMap: FanControl bez dodatkowych feature'ów → 0
+      // FeatureMap: FanControl without extra features → 0 / bez dodatkowych feature'ów
       if (aId == 0xFFFC) { *val = esp_matter_uint32(0); return ESP_OK; }
       // ClusterRevision: FanControl rev 2
       if (aId == 0xFFFD) { *val = esp_matter_uint16(2); return ESP_OK; }
@@ -981,6 +1054,7 @@ protected:
 
     if (!_addBridgedBasicInfo(ep)) return nullptr;
 
+    // FIX: set the correct DeviceType ID – Fan (0x002B)
     // POPRAWKA: ustaw właściwy DeviceType ID – Fan (0x002B)
     esp_matter::endpoint::add_device_type(ep, 0x002B, 1);
 
@@ -990,9 +1064,15 @@ protected:
 
 // ============================================================
 //  MBWindowCovering
-//  Matter: Window Covering (0x0202) – roleta / żaluzja
+//  Matter: Window Covering (0x0202) – blind / shutter (roleta / żaluzja)
 //  Cluster: WindowCovering – CurrentPositionLiftPercent100ths
 //
+//  NOTE: esp-matter SDK 3.3.6 does not provide set_command_callback
+//  for the WindowCovering cluster. The stack translates the commands
+//  (GoToLiftPercentage, UpOrOpen, DownOrClose) into a write of the
+//  TargetPositionLiftPercent100ths attribute via an internal handler – so
+//  onAttrWrite on this attribute WORKS correctly even though the hub sends a command.
+//  No separate command callback is needed.
 //  UWAGA: SDK esp-matter 3.3.6 nie udostępnia set_command_callback
 //  dla klastra WindowCovering. Komendy (GoToLiftPercentage, UpOrOpen,
 //  DownOrClose) stos tłumaczy na zapis atrybutu
@@ -1000,9 +1080,9 @@ protected:
 //  onAttrWrite na tym atrybucie DZIAŁA poprawnie mimo że hub wysyła komendę.
 //  Nie trzeba osobnego callbacku komend.
 //
-//  Użycie:
+//  Usage / Użycie:
 //    auto* r = static_cast<MBWindowCovering*>(MatterBridge.device(slot));
-//    r->setPosition(50);   // 50% otwarta
+//    r->setPosition(50);   // 50% open / otwarta
 // ============================================================
 class MBWindowCovering final : public MBDevice {
 public:
@@ -1036,7 +1116,7 @@ public:
       if (aId == WindowCovering::Attributes::Mode::Id) {
         *val = esp_matter_bitmap8(0); return ESP_OK;
       }
-      // FeatureMap: WindowCovering z feature LF (Lift) = bit0 → 1
+      // FeatureMap: WindowCovering with the LF (Lift) feature = bit0 → 1 / z feature LF (Lift)
       if (aId == 0xFFFC) { *val = esp_matter_uint32(1); return ESP_OK; }
       // ClusterRevision: WindowCovering rev 5
       if (aId == 0xFFFD) { *val = esp_matter_uint16(5); return ESP_OK; }
@@ -1044,6 +1124,8 @@ public:
     return MBDevice::onAttrRead(cId, aId, val);
   }
 
+  // SDK 3.3.6: the stack translates the GoToLiftPercentage/UpOrOpen/DownOrClose
+  // commands into a write of TargetPositionLiftPercent100ths – this callback is invoked
   // SDK 3.3.6: stos tłumaczy komendy GoToLiftPercentage/UpOrOpen/DownOrClose
   // na zapis TargetPositionLiftPercent100ths – ten callback jest wywoływany
   esp_err_t onAttrWrite(uint32_t cId, uint32_t aId,
@@ -1079,6 +1161,7 @@ protected:
 
     if (!_addBridgedBasicInfo(ep)) return nullptr;
 
+    // FIX: set the correct DeviceType ID – Window Covering (0x0202)
     // POPRAWKA: ustaw właściwy DeviceType ID – Window Covering (0x0202)
     esp_matter::endpoint::add_device_type(ep, 0x0202, 1);
 
@@ -1089,11 +1172,13 @@ private:
   void _reportPosition() {
     uint16_t p100 = (uint16_t)_attrs.coveringPos * 100;
     esp_matter_attr_val_t cur = esp_matter_nullable_uint16(p100);
+    // Report Current – visible to the hub as the current state
     // Raportuj Current – widoczne dla huba jako aktualny stan
     reportAttribute(
       chip::app::Clusters::WindowCovering::Id,
       chip::app::Clusters::WindowCovering::Attributes::CurrentPositionLiftPercent100ths::Id,
       &cur);
+    // Report Target = Current – the hub knows the movement has finished (Current==Target)
     // Raportuj Target = Current – hub wie że ruch się zakończył (Current==Target)
     reportAttribute(
       chip::app::Clusters::WindowCovering::Id,
@@ -1105,11 +1190,19 @@ private:
 // ============================================================
 //  MBElectricalPlug
 //
-//  Matter: On/Off Plug-in Unit (0x010A) z pomiarem energii elektrycznej.
+//  Matter: On/Off Plug-in Unit (0x010A) with electrical energy measurement / z pomiarem energii elektrycznej.
 //
 //  ════════════════════════════════════════════════════════════
-//  HISTORIA BŁĘDÓW – czytaj zanim cokolwiek zmienisz
+//  BUG HISTORY – read before changing anything / HISTORIA BŁĘDÓW – czytaj zanim cokolwiek zmienisz
 //  ════════════════════════════════════════════════════════════
+//
+//  BUG #1 – Wrong current attribute (fixed in the 2025-05-12 session)
+//    Symptom: compile error
+//      'chip::app::Clusters::ElectricalPowerMeasurement::Attributes::Current'
+//      has not been declared
+//    Cause: the AC current attribute in the EPM cluster (0x0090) is called
+//      ActiveCurrent, not Current.
+//    Fix: changed to Attributes::ActiveCurrent::Id.
 //
 //  BŁĄD #1 – Zły atrybut prądu (naprawiony w sesji 2025-05-12)
 //    Symptom: błąd kompilacji
@@ -1118,6 +1211,16 @@ private:
 //    Przyczyna: atrybut prądu AC w klastrze EPM (0x0090) nazywa się
 //      ActiveCurrent, nie Current.
 //    Naprawa: zmiana na Attributes::ActiveCurrent::Id.
+//
+//  BUG #2 – Missing 4th argument of create() for the EPM/EEM clusters (fixed)
+//    Symptom: compile error "too few arguments"
+//    Cause: in esp-matter 3.3.8 the Matter 1.3 clusters (EPM/EEM) require an
+//      explicit features bitmap as the 4th argument of create().
+//      Without it the optional attributes (Voltage, ActiveCurrent, ActivePower, etc.)
+//      are not registered in the Matter stack.
+//    Fix:
+//      EPM: features = 1        (bit 0 = AlternatingCurrent / AC)
+//      EEM: features = 0x05     (bit 0 = ImportedEnergy, bit 2 = CumulativeEnergy)
 //
 //  BŁĄD #2 – Brakujący 4. argument create() klastrów EPM/EEM (naprawiony)
 //    Symptom: błąd kompilacji "too few arguments"
@@ -1129,12 +1232,31 @@ private:
 //      EPM: features = 1        (bit 0 = AlternatingCurrent / AC)
 //      EEM: features = 0x05     (bit 0 = ImportedEnergy, bit 2 = CumulativeEnergy)
 //
+//  BUG #3 – Missing onAttrRead() (fixed)
+//    Symptom: the plug is visible in the hub, but all measurements are empty / missing
+//    Cause: the base class MBDevice::onAttrRead() handles only the clusters
+//      BooleanState, OccupancySensing, BridgedDeviceBasicInformation.
+//      Hub queries for EPM / EEM returned ESP_ERR_NOT_FOUND → the hub showed nothing.
+//    Fix: override onAttrRead() in this class, handling EPM and EEM.
+//
 //  BŁĄD #3 – Brak onAttrRead() (naprawiony)
 //    Symptom: gniazdko widoczne w hubie, ale wszystkie pomiary puste / brak
 //    Przyczyna: klasa bazowa MBDevice::onAttrRead() obsługuje tylko klastry
 //      BooleanState, OccupancySensing, BridgedDeviceBasicInformation.
 //      Zapytania huba o EPM / EEM zwracały ESP_ERR_NOT_FOUND → hub nic nie pokazywał.
 //    Naprawa: override onAttrRead() w tej klasie obsługujący EPM i EEM.
+//
+//  BUG #4 – No explicit attribute::create() for Voltage/ActiveCurrent/ActivePower/
+//            CumulativeEnergyImported (fixed)
+//    Symptom: empty measurements despite a correct onAttrRead() and feature flags
+//    Cause: esp-matter registers the cluster via create(), but optional
+//      attributes exist in the stack ONLY if they are explicitly created with
+//      attribute::create(). Without it attribute::update() in the setters returns
+//      0x586 UNSUPPORTED_ATTRIBUTE and updates nothing.
+//      The same problem occurred earlier with UniqueID and SoftwareVersion
+//      in _addBridgedBasicInfo() – analogous solution.
+//    Fix: explicit attribute::create() for each measurement attribute
+//      right after the cluster's create().
 //
 //  BŁĄD #4 – Brak jawnego attribute::create() dla Voltage/ActiveCurrent/ActivePower/
 //            CumulativeEnergyImported (naprawiony)
@@ -1148,6 +1270,16 @@ private:
 //    Naprawa: jawne attribute::create() dla każdego atrybutu pomiarowego
 //      bezpośrednio po create() klastra.
 //
+//  BUG #5 – Inconsistent value type: esp_matter_int32 vs esp_matter_nullable_int32
+//    Symptom: reportAttribute() silently returns an error; measurements do not update
+//    Cause: the EPM attributes (Voltage, ActiveCurrent, ActivePower) are
+//      NULLABLE per the Matter 1.4 spec (nullable int64, units mV/mA/mW).
+//      The setter used esp_matter_int32 (non-nullable), onAttrRead returned
+//      esp_matter_nullable_int32. The Matter stack checks type compatibility in
+//      attribute::update() – a mismatch = rejection without a log.
+//    Fix: esp_matter_nullable_int64 everywhere (the spec says int64, not int32).
+//      Scale: Voltage in mV, ActiveCurrent in mA, ActivePower in mW.
+//
 //  BŁĄD #5 – Niespójny typ wartości: esp_matter_int32 vs esp_matter_nullable_int32
 //    Symptom: reportAttribute() cicho zwraca błąd; pomiary nie aktualizują się
 //    Przyczyna: atrybuty EPM (Voltage, ActiveCurrent, ActivePower) są
@@ -1157,6 +1289,17 @@ private:
 //      attribute::update() – niezgodność = odrzucenie bez logu.
 //    Naprawa: wszędzie esp_matter_nullable_int64 (spec mówi int64, nie int32).
 //      Skala: Voltage w mV, ActiveCurrent w mA, ActivePower w mW.
+//
+//  BUG #6 – CumulativeEnergyImported as a bare int64 instead of a struct
+//    Symptom: energy counter always 0 or missing in the hub
+//    Cause: per the Matter 1.4 spec (doc chapter 5.1) CumulativeEnergyImported
+//      is EnergyMeasurementStruct { Energy: int64 [mWh], Timestamp: uint32 [UTC] }.
+//      esp-matter stores it as nullable int64 (SDK simplification) –
+//      reporting a bare esp_matter_int64 is OK for esp-matter,
+//      but the type must be CONSISTENT across attribute::create(), onAttrRead()
+//      and reportAttribute(). The earlier code mixed int64 and nullable_int64.
+//    Fix: esp_matter_nullable_int64(mWh) everywhere. The timestamp is omitted
+//      (esp-matter has no native EnergyMeasurementStruct support in SDK 3.3.x).
 //
 //  BŁĄD #6 – CumulativeEnergyImported jako gołe int64 zamiast struct
 //    Symptom: licznik energii zawsze 0 lub brak w hubie
@@ -1169,11 +1312,27 @@ private:
 //    Naprawa: wszędzie esp_matter_nullable_int64(mWh). Timestamp pomijamy
 //      (esp-matter nie ma natywnego wsparcia EnergyMeasurementStruct w SDK 3.3.x).
 //
+//  BUG #7 – Wrong cluster IDs in comments (documentation only, not code)
+//    EPM was marked in comments as 0x0091 → the correct ID is 0x0090
+//    EEM was marked in comments as 0x0092 → the correct ID is 0x0091
+//    The code uses C++ symbols (ElectricalPowerMeasurement::Id), so it compiles
+//    correctly, but the comments are misleading when debugging logs.
+//
 //  BŁĄD #7 – Błędne ID klastrów w komentarzach (tylko dokumentacja, nie kod)
 //    EPM w komentarzach oznaczone jako 0x0091 → prawidłowe ID to 0x0090
 //    EEM w komentarzach oznaczone jako 0x0092 → prawidłowe ID to 0x0091
 //    Kod używa symboli C++ (ElectricalPowerMeasurement::Id) więc kompiluje się
 //    poprawnie, ale komentarze wprowadzają w błąd przy debugowaniu logów.
+//
+//  BUG #8 – Missing PowerTopology cluster (0x009C)
+//    Symptom: some hubs (Google Home, Apple Home) may not show measurements
+//    Cause: Matter spec 1.3+ requires the PowerTopology cluster on an
+//      ElectricalSensor (0x0510) endpoint. It contains the AvailableEndpoints
+//      and ActiveEndpoints attributes pointing to the measured endpoints.
+//    Fix (2025-05-12): added the PowerTopology cluster created via
+//      esp_matter::cluster::create() with the raw ID 0x009C.
+//      esp_matter_array is used with a (uint8_t*) cast to pass
+//      the endpoint list as uint16_t.
 //
 //  BŁĄD #8 – Brak klastra PowerTopology (0x009C)
 //    Symptom: część hubów (Google Home, Apple Home) może nie wyświetlać pomiarów
@@ -1185,6 +1344,14 @@ private:
 //      Użyto esp_matter_array z rzutowaniem (uint8_t*), aby przekazać
 //      listę endpointów jako uint16_t.
 //
+//  BUG #9 – Compilation: on_off::config_t initialisation (fixed 2025-05-12)
+//    Symptom: could not convert '{false}' ... to config_t
+//    Cause: the form `config_t ooCfg = { false };` is invalid.
+//      The config_t struct has an `on_off` field and is not an aggregate.
+//    Fix: restored the original form:
+//      config_t ooCfg = {};
+//      ooCfg.on_off = false;
+//
 //  BŁĄD #9 – Kompilacja: inicjalizacja on_off::config_t (naprawiony 2025-05-12)
 //    Symptom: could not convert '{false}' ... to config_t
 //    Przyczyna: zapis `config_t ooCfg = { false };` jest niepoprawny.
@@ -1192,6 +1359,17 @@ private:
 //    Naprawa: przywrócono pierwotny zapis:
 //      config_t ooCfg = {};
 //      ooCfg.on_off = false;
+//
+//  BUG #10 – Compilation: `Attributes` ambiguity (fixed 2025-05-12)
+//    Symptom: reference to 'Attributes' is ambiguous
+//    Cause: using `using namespace chip::app::Clusters::ElectricalEnergyMeasurement;`
+//      inside _buildEndpoint() makes both EPM::Attributes and
+//      EEM::Attributes visible, which causes a conflict.
+//    Fix: removed all `using namespace` from _buildEndpoint().
+//      All attributes are now fully qualified (e.g.
+//      chip::app::Clusters::ElectricalPowerMeasurement::Attributes::Voltage::Id).
+//      In onAttrRead() `using namespace chip::app::Clusters;` is safe,
+//      because EPM::Attributes and EEM::Attributes are distinguished there by the full path.
 //
 //  BŁĄD #10 – Kompilacja: niejednoznaczność `Attributes` (naprawiony 2025-05-12)
 //    Symptom: reference to 'Attributes' is ambiguous
@@ -1204,6 +1382,15 @@ private:
 //      W onAttrRead() `using namespace chip::app::Clusters;` jest bezpieczne,
 //      bo EPM::Attributes i EEM::Attributes są tam rozróżniane przez pełną ścieżkę.
 //
+//  BUG #11 – Feedback loop in onAttrWrite (fixed 2026-05-29)
+//    Symptom: the callback (_callback) is not invoked, or the stack deadlocks
+//    Cause: calling reportAttribute() inside onAttrWrite() notifies the
+//      Matter stack again about the attribute change, which can lead
+//      to recursion or to the stack rejecting the whole write callback.
+//    Fix: removed the redundant reportAttribute() – the hub already knows the new
+//      value because it set it itself. reportAttribute is only needed for changes
+//      that originate from the device (e.g. a physical button).
+//
 //  BŁĄD #11 – Pętla zwrotna w onAttrWrite (naprawiony 2026-05-29)
 //    Symptom: brak wywołania callbacka (_callback) lub zakleszczenie stosu
 //    Przyczyna: wywołanie reportAttribute() wewnątrz onAttrWrite() powoduje
@@ -1214,8 +1401,16 @@ private:
 //      pochodzących z urządzenia (np. przycisk fizyczny).
 //
 //  ════════════════════════════════════════════════════════════
-//  ARCHITEKTURA – ważna uwaga do przyszłych zmian
+//  ARCHITECTURE – important note for future changes / ARCHITEKTURA – ważna uwaga do przyszłych zmian
 //  ════════════════════════════════════════════════════════════
+//
+//  The Matter 1.4 spec (section 2 of the document) recommends two separate endpoints:
+//    EP1: On/Off Plug-in Unit (0x010A) – OnOff only
+//    EP2: Electrical Sensor  (0x0510) – PowerTopology + EPM + EEM
+//  The current implementation combines both in ONE bridged_node endpoint.
+//  It works on SmartThings (tested). If other hubs have problems,
+//  it has to be split into two endpoints – this requires refactoring
+//  MBElectricalPlug into two classes (or one object managing two endpoints).
 //
 //  Spec Matter 1.4 (sekcja 2 dokumentu) zaleca dwa osobne endpointy:
 //    EP1: On/Off Plug-in Unit (0x010A) – tylko OnOff
@@ -1226,30 +1421,39 @@ private:
 //  na dwie klasy (lub jeden obiekt zarządzający dwoma endpointami).
 //
 //  ════════════════════════════════════════════════════════════
-//  JEDNOSTKI (Matter 1.4 Application Cluster Spec)
+//  UNITS / JEDNOSTKI (Matter 1.4 Application Cluster Spec)
 //  ════════════════════════════════════════════════════════════
-//  Voltage:      mV  (int64 nullable)  np. 230000 = 230.000 V
-//  ActiveCurrent:mA  (int64 nullable)  np. 500    = 0.500 A
-//  ActivePower:  mW  (int64 nullable)  np. 115000 = 115.0 W
-//  Energy:       mWh (int64 nullable)  np. 1000000= 1.000 kWh
+//  Voltage:      mV  (int64 nullable)  e.g./np. 230000 = 230.000 V
+//  ActiveCurrent:mA  (int64 nullable)  e.g./np. 500    = 0.500 A
+//  ActivePower:  mW  (int64 nullable)  e.g./np. 115000 = 115.0 W
+//  Energy:       mWh (int64 nullable)  e.g./np. 1000000= 1.000 kWh
 //
-//  MBAttrStore przechowuje:
+//  MBAttrStore stores / przechowuje:
 //    voltage     uint16  [0.01 V]    → ×10    → mV
-//    current     uint16  [0.001 A]   → ×1     → mA (current już jest w mA ×0.001 co jest mA)
+//    current     uint16  [0.001 A]   → ×1     → mA (current is already in 0.001 A steps = mA / current już jest w mA ×0.001 co jest mA)
 //    activePower int16   [0.1 W]     → ×100   → mW
 //    energy      uint32  [Wh]        → ×1000  → mWh
 // ============================================================
 // ============================================================
 //  MBElectricalPlug
 //
-//  Matter: On/Off Plug-in Unit (0x010A) z pomiarem energii elektrycznej.
+//  Matter: On/Off Plug-in Unit (0x010A) with electrical energy measurement / z pomiarem energii elektrycznej.
 //
 //  ════════════════════════════════════════════════════════════
-//  HISTORIA BŁĘDÓW – czytaj zanim cokolwiek zmienisz
+//  BUG HISTORY – read before changing anything / HISTORIA BŁĘDÓW – czytaj zanim cokolwiek zmienisz
 //  ...
-//  (pełną historię błędów zachowałem z Twojego kodu)
+//  (the full bug history was kept from your code / pełną historię błędów zachowałem z Twojego kodu)
 //  ...
 //  ════════════════════════════════════════════════════════════
+//  BUG #12 – Duplicate CumulativeEnergyImported attribute (fixed 2026-05-29)
+//    Symptom: runtime error "Insufficient space for reading Endpoint
+//      0x0002's Cluster 0x00000091's Attribute 0x00000001: required: 4, max: 2"
+//    Cause: the ElectricalEnergyMeasurement cluster (0x0091) with the ImportedEnergy
+//      feature enabled creates attribute 0x0001 by itself. A manual attribute::create()
+//      caused a metadata conflict (2-byte buffer vs a callback returning 9 bytes).
+//    Fix: removed the redundant attribute::create() for CumulativeEnergyImported.
+//      The attribute is created automatically with the nullable_int64 type.
+//
 //  BŁĄD #12 – Duplikacja atrybutu CumulativeEnergyImported (naprawiony 2026-05-29)
 //    Symptom: błąd uruchomieniowy "Insufficient space for reading Endpoint
 //      0x0002's Cluster 0x00000091's Attribute 0x00000001: required: 4, max: 2"
@@ -1260,14 +1464,14 @@ private:
 //      Atrybut jest poprawnie tworzony automatycznie z typem nullable_int64.
 //
 //  ════════════════════════════════════════════════════════════
-//  JEDNOSTKI (Matter 1.4 Application Cluster Spec)
+//  UNITS / JEDNOSTKI (Matter 1.4 Application Cluster Spec)
 //  ════════════════════════════════════════════════════════════
-//  Voltage:      mV  (int64 nullable)  np. 230000 = 230.000 V
-//  ActiveCurrent:mA  (int64 nullable)  np. 500    = 0.500 A
-//  ActivePower:  mW  (int64 nullable)  np. 115000 = 115.0 W
-//  Energy:       mWh (int64 nullable)  np. 1000000= 1.000 kWh
+//  Voltage:      mV  (int64 nullable)  e.g./np. 230000 = 230.000 V
+//  ActiveCurrent:mA  (int64 nullable)  e.g./np. 500    = 0.500 A
+//  ActivePower:  mW  (int64 nullable)  e.g./np. 115000 = 115.0 W
+//  Energy:       mWh (int64 nullable)  e.g./np. 1000000= 1.000 kWh
 //
-//  MBAttrStore przechowuje:
+//  MBAttrStore stores / przechowuje:
 //    voltage     uint16  [0.01 V]    → ×10    → mV
 //    current     uint16  [0.001 A]   → ×1     → mA
 //    activePower int16   [0.1 W]     → ×100   → mW
@@ -1285,7 +1489,7 @@ public:
                         chip::app::Clusters::OnOff::Attributes::OnOff::Id, &val);
     }
 
-    // ── Settery – konwersja na jednostki bazowe Matter ──────────────────────
+    // ── Setters – conversion to Matter base units / Settery – konwersja na jednostki bazowe Matter ──────────────────────
     void setVoltage(uint16_t voltage_0_01V) {
         _attrs.voltage = voltage_0_01V;
         esp_matter_attr_val_t val = esp_matter_nullable_int64((int64_t)voltage_0_01V * 10);
@@ -1427,6 +1631,9 @@ protected:
         }
 
         // ElectricalEnergyMeasurement (0x0091)
+        // ⚠️ IMPORTANT: CumulativeEnergyImported is created automatically
+        // by the cluster. It must not be created a second time – remove the block
+        // that existed earlier!
         // ⚠️ WAŻNE: CumulativeEnergyImported jest tworzony automatycznie
         // przez klaster. Nie wolno go tworzyć drugi raz – usuń ten blok,
         // który był wcześniej!
@@ -1465,6 +1672,22 @@ private:
 
 // ============================================================
 //  MBTempHumidSensor
+//  Matter: Temperature & Humidity Sensor – one endpoint,
+//          two measurement clusters.
+//
+//  DeviceType:
+//    0x0302  Temperature Sensor  – required, ST recognises the sensor
+//    0x0307  Humidity Sensor     – added alongside, ST sees one
+//                                  device with two attributes
+//
+//  Clusters:
+//    TemperatureMeasurement   (0x0402)  – MeasuredValue int16 ×100
+//    RelativeHumidityMeasurement (0x0405) – MeasuredValue uint16 ×100
+//
+//  Scaling:
+//    setTemperature(21.5f)  → _attrs.temperature = 2150  → ST: 21.5 °C
+//    setHumidity(55.3f)     → _attrs.humidity    = 5530  → ST: 55.3 %
+//
 //  Matter: Temperature & Humidity Sensor – jeden endpoint,
 //          dwa klastry pomiarowe.
 //
@@ -1473,7 +1696,7 @@ private:
 //    0x0307  Humidity Sensor     – dodany obok, ST widzi jedno
 //                                  urządzenie z dwoma atrybutami
 //
-//  Klastry:
+//  Clusters / Klastry:
 //    TemperatureMeasurement   (0x0402)  – MeasuredValue int16 ×100
 //    RelativeHumidityMeasurement (0x0405) – MeasuredValue uint16 ×100
 //
@@ -1481,11 +1704,13 @@ private:
 //    setTemperature(21.5f)  → _attrs.temperature = 2150  → ST: 21.5 °C
 //    setHumidity(55.3f)     → _attrs.humidity    = 5530  → ST: 55.3 %
 //
-//  Użycie (z zewnętrznego źródła danych, np. UART/MQTT):
+//  Usage (from an external data source, e.g. UART/MQTT) / Użycie (z zewnętrznego źródła danych, np. UART/MQTT):
 //    auto* th = static_cast<MBTempHumidSensor*>(MatterBridge.device(slot));
 //    th->setTemperature(21.5f);
 //    th->setHumidity(55.3f);
 //
+//  NOTE: MBDeviceType::TempHumidSensor must be added to the
+//        MBDeviceType enum in MBDevice.h before using this class.
 //  UWAGA: MBDeviceType::TempHumidSensor musi być dodany do enum
 //         MBDeviceType w MBDevice.h przed użyciem tej klasy.
 // ============================================================
@@ -1494,10 +1719,10 @@ public:
   explicit MBTempHumidSensor(const MBDescriptor& d) : MBDevice(d) {}
   MBDeviceType deviceType() const override { return MBDeviceType::TempHumidSensor; }
 
-  // applyState() – czujnik pasywny, brak stanu boolowskiego.
+  // applyState() – passive sensor, no boolean state / czujnik pasywny, brak stanu boolowskiego.
   void applyState(bool /*unused*/) override {}
 
-  // ── Settery – wywoływane z zewnętrznego źródła danych ──────────
+  // ── Setters – called from an external data source / Settery – wywoływane z zewnętrznego źródła danych ──────────
 
   void setTemperature(float celsius) {
     _attrs.temperature = (int16_t)(celsius * 100.0f);
@@ -1571,14 +1796,14 @@ protected:
       esp_matter::endpoint::bridged_node::create(node, &cfg, ENDPOINT_FLAG_BRIDGE, this);
     if (!ep) { ESP_LOGE("TempHumid", "bridged_node create failed"); return nullptr; }
 
-    // Identify – wymagany przez spec dla każdego endpointu
+    // Identify – required by the spec for every endpoint / wymagany przez spec dla każdego endpointu
     esp_matter::cluster::identify::config_t iCfg = {};
     auto* id = esp_matter::cluster::identify::create(ep, &iCfg, CLUSTER_FLAG_SERVER);
     if (!id) { ESP_LOGE("TempHumid", "identify create failed"); return nullptr; }
 
     // ── TemperatureMeasurement ─────────────────────────────────────────────
     esp_matter::cluster::temperature_measurement::config_t tCfg = {};
-    tCfg.measured_value     = (int16_t)2000;   // placeholder 20.00°C (niezerowy!)
+    tCfg.measured_value     = (int16_t)2000;   // placeholder 20.00°C (non-zero! / niezerowy!)
     tCfg.min_measured_value = (int16_t)-4000;
     tCfg.max_measured_value = (int16_t)8500;
     auto* tc = esp_matter::cluster::temperature_measurement::create(
@@ -1587,7 +1812,7 @@ protected:
 
     // ── RelativeHumidityMeasurement ────────────────────────────────────────
     esp_matter::cluster::relative_humidity_measurement::config_t hCfg = {};
-    hCfg.measured_value     = (uint16_t)5000;  // placeholder 50.00% (niezerowy!)
+    hCfg.measured_value     = (uint16_t)5000;  // placeholder 50.00% (non-zero! / niezerowy!)
     hCfg.min_measured_value = (uint16_t)0;
     hCfg.max_measured_value = (uint16_t)10000;
     auto* hc = esp_matter::cluster::relative_humidity_measurement::create(
@@ -1597,8 +1822,8 @@ protected:
     if (!_addBridgedBasicInfo(ep)) return nullptr;
 
     // ── DeviceType IDs ─────────────────────────────────────────────────────
-    // 0x0302 Temperature Sensor – główny, ST rozpoznaje typ urządzenia
-    // 0x0307 Humidity Sensor    – dodatkowy, ST widzi oba pomiary w jednym kafelku
+    // 0x0302 Temperature Sensor – primary, ST recognises the device type / główny, ST rozpoznaje typ urządzenia
+    // 0x0307 Humidity Sensor    – secondary, ST shows both measurements in one tile / dodatkowy, ST widzi oba pomiary w jednym kafelku
     esp_matter::endpoint::add_device_type(ep, 0x0302, 1);
     esp_matter::endpoint::add_device_type(ep, 0x0307, 1);
 

@@ -35,7 +35,7 @@ Biblioteka mostka Matter dla **ESP32-C6** i **ESP32-S3** (Arduino-ESP32 3.x, nat
 | Wilgotność | Humidity Sensor | `addHumiditySensorRuntime` |
 | Temperatura + wilgotność | jeden endpoint, dwa klastry | `addTempHumidSensorRuntime` |
 | Światło On/Off | On/Off Light | `addOnOffLightRuntime` |
-| Światło ściemniacz | Dimmable Light | `addDimmableLightRuntime` |
+| Światło ściemnialne | Dimmable Light | `addDimmableLightRuntime` |
 | Światło CT | Color Temperature Light | `addColorTempLightRuntime` |
 | Gniazdko | On/Off Plug-in Unit | `addOnOffPlugRuntime` |
 | Wentylator | Fan | `addFanRuntime` |

@@ -34,6 +34,25 @@
 #endif
 
 // ============================================================
+//  MBStorage.h – data persistence layer (NVS / Preferences)
+//
+//  Responsible only for saving and loading the device configuration.
+//  Zero use of String – only char arrays and primitive types.
+//
+//  NVS format:
+//    "cnt"     → uint8_t  number of saved devices
+//    "t{i}"    → uint8_t  MBDeviceType
+//    "n{i}"    → char[]   name (max MB_MAX_NAME_LEN+1 bytes)
+//    "p{i}"    → uint8_t  pin
+//    "v{i}"    → uint8_t  pinInverted (0/1)
+//
+//  NVS keys are at most 15 characters long (an ESP-IDF limitation).
+//  Format: a letter + a decimal number (max 2 digits → max 99 devices).
+//
+//  Memory layout of the descriptor table:
+//    C6: _descs[MB_MAX_DEVICES] – static member in DRAM (20 × 36B = 720B)
+//    S3: _descs* in PSRAM       – 50 × 36B = 1800B outside DRAM
+//
 //  MBStorage.h – warstwa trwałości danych (NVS / Preferences)
 //
 //  Odpowiada wyłącznie za zapis i odczyt konfiguracji urządzeń.
@@ -58,6 +77,8 @@ class MBStorage {
 public:
   MBStorage() : _count(0) {
 #if MB_USE_PSRAM
+    // Allocate the descriptor table in PSRAM
+    // MALLOC_CAP_8BIT is required by struct assignments (byte-wise)
     // Alokuj tablicę deskryptorów w PSRAM
     // MALLOC_CAP_8BIT wymagany przez przypisania struct (byte-po-byte)
     _descs = static_cast<MBDescriptor*>(
@@ -75,6 +96,8 @@ public:
                (unsigned)(MB_MAX_DEVICES * sizeof(MBDescriptor)));
     }
 
+    // Explicit initialisation via placement new – calloc zeroes the memory but does not
+    // call constructors. MBDescriptor has a constructor that sets the fields.
     // Jawna inicjalizacja przez placement new – calloc zeruje, ale nie
     // wywołuje konstruktorów. MBDescriptor ma konstruktor ustawiający pola.
     for (uint8_t i = 0; i < MB_MAX_DEVICES; i++) {
@@ -94,6 +117,8 @@ public:
   }
 #endif
 
+  // Load the configuration from NVS into the internal descriptor buffer.
+  // Returns the number of loaded devices.
   // Wczytaj konfigurację z NVS do wewnętrznego bufora deskryptorów.
   // Zwraca liczbę wczytanych urządzeń.
   uint8_t load() {
@@ -123,6 +148,8 @@ public:
     return _count;
   }
 
+  // Save the full configuration (from the internal buffer) to NVS.
+  // Overwrites all keys.
   // Zapisz pełną konfigurację (z wewnętrznego bufora) do NVS.
   // Nadpisuje wszystkie klucze.
   void save() {
@@ -149,6 +176,7 @@ public:
     prefs.end();
   }
 
+  // Append a descriptor to the buffer. Returns false when the buffer is full.
   // Dodaj deskryptor do bufora. Zwraca false gdy bufor pełny.
   bool append(const MBDescriptor& desc) {
     if (_count >= MB_MAX_DEVICES) return false;
@@ -156,6 +184,8 @@ public:
     return true;
   }
 
+  // Remove the descriptor at the given index (shifts the rest to the left).
+  // Returns false when the index is out of range.
   // Usuń deskryptor o podanym indeksie (przesuwa pozostałe w lewo).
   // Zwraca false gdy indeks poza zakresem.
   bool remove(uint8_t index) {
@@ -167,6 +197,7 @@ public:
     return true;
   }
 
+  // Clear the whole NVS namespace.
   // Wyczyść cały namespace NVS.
   void clear() {
     Preferences prefs;
@@ -176,20 +207,23 @@ public:
     _count = 0;
   }
 
+  // Descriptor access
   // Dostęp do deskryptorów
   uint8_t             count()          const { return _count; }
   const MBDescriptor& get(uint8_t i)   const { return _descs[i]; }
   MBDescriptor&       get(uint8_t i)         { return _descs[i]; }
 
 private:
-// ── Warunkowy layout tablicy deskryptorów ─────────────────────────────────────
+// ── Conditional layout of the descriptor table / Warunkowy layout tablicy deskryptorów ─────────────────────────────────────
 #if MB_USE_PSRAM
-  MBDescriptor* _descs;         // wskaźnik do bloku PSRAM
+  MBDescriptor* _descs;         // pointer to the PSRAM block / wskaźnik do bloku PSRAM
 #else
-  MBDescriptor  _descs[MB_MAX_DEVICES];  // statyczny member w DRAM
+  MBDescriptor  _descs[MB_MAX_DEVICES];  // static member in DRAM / statyczny member w DRAM
 #endif
   uint8_t       _count;
 
+  // Builds an NVS key: a letter + a number, e.g. 'n' + 3 → "n3"
+  // The result goes into the key buffer (min 8 bytes).
   // Buduje klucz NVS: litera + liczba, np. 'n' + 3 → "n3"
   // Wynik w buforze key (min 8 bajtów).
   static void _buildKey(char* key, char prefix, uint8_t index) {

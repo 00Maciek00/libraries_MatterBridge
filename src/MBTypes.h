@@ -103,13 +103,13 @@ struct MBAttrStore {
   uint8_t switchPosition;  // Switch: 0=released/zwolniony, 1=pressed/wciśnięty
 
   // Measurement sensors (x100 per Matter spec) / Sensory pomiarowe (x100 wg specyfikacji Matter)
-  int16_t temperature;     // °C × 100  (np. 2150 = 21.50°C)
-  uint16_t humidity;       // %RH × 100 (np. 5500 = 55.00%)
+  int16_t temperature;     // °C × 100  (e.g./np. 2150 = 21.50°C)
+  uint16_t humidity;       // %RH × 100 (e.g./np. 5500 = 55.00%)
 
   // Control (OnOff / Dimmer / Color / Fan / Covering) / Sterowanie
-  bool    onOff;           // true = włączone
+  bool    onOff;           // true = on / włączone
   uint8_t level;           // 0-254 (LevelControl)
-  uint16_t colorTemp;      // mireds (ColorControl, np. 370 = 2700K)
+  uint16_t colorTemp;      // mireds (ColorControl, e.g./np. 370 = 2700K)
   uint8_t  fanMode;        // FanControl: 0=off,1=low,2=med,3=high,4=on,5=auto
   uint8_t  coveringPos;    // WindowCovering: 0-100% (percentage)
 
@@ -148,8 +148,10 @@ struct MBAttrStore {
 class MBDataSource {
 public:
   virtual ~MBDataSource() = default;
+  // Returns the current value. Call cyclically in tick().
   // Zwraca aktualną wartość. Wywołuj cyklicznie w tick().
   virtual bool read(bool& out) = 0;
+  // Returns true if the source has a new value (edge-triggered)
   // Zwraca true jeśli źródło ma nową wartość (edge-triggered)
   virtual bool hasChanged() = 0;
 };

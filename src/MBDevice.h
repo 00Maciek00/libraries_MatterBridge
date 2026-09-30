@@ -27,8 +27,9 @@
 #pragma once
 #include <Arduino.h>
 #include "MBTypes.h"
-#include "MBNode.h"   // extern MBNode – używane w registerOn()
+#include "MBNode.h"   // extern MBNode – used in registerOn() / używane w registerOn()
 
+// ESP-IDF headers – available through arduino-esp32 3.x without Matter.h
 // ESP-IDF headers – dostępne przez arduino-esp32 3.x bez Matter.h
 #include <esp_matter.h>
 #include <esp_matter_cluster.h>
@@ -36,6 +37,7 @@
 #include <esp_matter_attribute_utils.h>
 #include <esp_log.h>
 
+// Cluster and attribute IDs from the CHIP SDK
 // IDs klastrów i atrybutów z CHIP SDK
 #include <app-common/zap-generated/ids/Clusters.h>
 #include <app-common/zap-generated/ids/Attributes.h>
@@ -46,6 +48,7 @@ using esp_matter::CLUSTER_FLAG_SERVER;
 using esp_matter::CLUSTER_FLAG_ATTRIBUTE_CHANGED_FUNCTION;
 
 // ============================================================
+//  MBDevice – native Matter device (no Arduino wrappers)
 //  MBDevice – natywne urządzenie Matter (bez Arduino wrapperów)
 // ============================================================
 class MBDevice {
@@ -68,12 +71,18 @@ public:
   virtual ~MBDevice() = default;
 
   // --------------------------------------------------------
+  //  registerOn – registers the endpoint in the Matter node.
+  //  Call BEFORE esp_matter::start() (static) or AFTER it (runtime).
   //  registerOn – rejestruje endpoint w węźle Matter.
   //  Wywołaj PRZED esp_matter::start() (statyczna) lub PO (runtime).
   // --------------------------------------------------------
   bool registerOn(esp_matter::node_t* node, bool runtime = false) {
     ESP_LOGI("MBDevice", "registerOn: start '%s' runtime=%d", _desc.name, (int)runtime);
 
+    // endpoint::create/enable modifies the internal structures of the Matter stack.
+    // When called after start() (runtime), chip_stack_lock is required –
+    // without the lock a race with the Matter thread may cause heap corruption or
+    // a missing endpoint registration (effect: no slot after DEV_ADD on the fly).
     // endpoint::create/enable modyfikuje wewnetrzne struktury stosu Matter.
     // Gdy wywolujemy po start() (runtime), wymagany chip_stack_lock –
     // bez locka wysc z watkiem Matter moze skutkowac heap corruption lub
@@ -92,11 +101,13 @@ public:
     _endpointId = esp_matter::endpoint::get_id(_endpoint);
     ESP_LOGI("MBDevice", "registerOn: epId=%u for '%s'", _endpointId, _desc.name);
 
+    // Attach the endpoint under the Aggregator (EP1)
     // Przypnij endpoint pod Agregator (EP1)
     extern MBNodeClass MBNode;
     uint16_t aggrEpId = MBNode.aggregatorEpId();
     if (aggrEpId != 0) {
       esp_matter::node_t* nd = esp_matter::node::get();
+      // Reading the aggregator structure – also under the lock at runtime
       // Odczyt struktury agregatora – rowniez pod lockiem przy runtime
       if (runtime) esp_matter::lock::chip_stack_lock(portMAX_DELAY);
       esp_matter::endpoint_t* aggrEp = nd
@@ -115,10 +126,13 @@ public:
     return true;
   }
 
+  // Remove the endpoint from the Matter stack (runtime)
   // Usuń endpoint ze stosu Matter (runtime)
   bool unregisterFrom(esp_matter::node_t* node) {
     if (!_endpoint || _endpointId == 0) return false;
 
+    // endpoint::destroy() modifies the internal structures of the Matter stack –
+    // it must be called under chip_stack_lock when called from the Arduino loop().
     // endpoint::destroy() modyfikuje wewnętrzne struktury stosu Matter –
     // musi być wywołane pod chip_stack_lock gdy wywołujemy z Arduino loop().
     esp_matter::lock::chip_stack_lock(portMAX_DELAY);
@@ -135,12 +149,14 @@ public:
   }
 
   // --------------------------------------------------------
+  //  applyState / deviceType – implement in derived classes
   //  applyState / deviceType – implementuj w klasach pochodnych
   // --------------------------------------------------------
   virtual void applyState(bool state) = 0;
   virtual MBDeviceType deviceType() const = 0;
 
   // --------------------------------------------------------
+  //  reportAttribute – notifies the Matter stack about a value change.
   //  reportAttribute – informuje stos Matter o zmianie wartości.
   // --------------------------------------------------------
   bool reportAttribute(uint32_t clusterId, uint32_t attrId,
@@ -150,6 +166,9 @@ public:
       return false;
     }
 
+    // FIX: chip_stack_lock is required when calling attribute::update()
+    // from loop() context (not from the Matter thread). Without the lock a race
+    // with the chip thread leads to heap corruption and random hangs/reboots.
     // POPRAWKA: chip_stack_lock wymagany gdy wywołujemy attribute::update()
     // z kontekstu loop() (nie z wątku Matter). Bez locka wyścig z wątkiem
     // chip prowadzi do korupcji sterty i losowych zawieszeń/restartów.
@@ -168,6 +187,7 @@ public:
   }
 
   // --------------------------------------------------------
+  //  onAttrRead / onAttrWrite – callbacks for external storage
   //  onAttrRead / onAttrWrite – callbacki external storage
   // --------------------------------------------------------
   virtual esp_err_t onAttrRead(uint32_t clusterId,
@@ -196,6 +216,9 @@ public:
         *val = esp_matter_char_str(const_cast<char*>(_desc.name), len);
         return ESP_OK;
       }
+      // SoftwareVersion (0x0009) – queried by SmartThings during commissioning.
+      // No answer → error 586 (UNSUPPORTED_ATTRIBUTE) → the hub blocks reading
+      // the whole endpoint and shows NaN / no data.
       // SoftwareVersion (0x0009) – odpytywany przez SmartThings przy komisjonowaniu.
       // Brak odpowiedzi → błąd 586 (UNSUPPORTED_ATTRIBUTE) → hub blokuje odczyt
       // całego endpointu i wyświetla NaN / brak danych.
@@ -203,13 +226,14 @@ public:
         *val = esp_matter_uint32(1);
         return ESP_OK;
       }
-      // UniqueID (0x0010) – jednoznaczna identyfikacja urządzenia między restartami mostka.
+      // UniqueID (0x0010) – unambiguous device identification across bridge reboots / jednoznaczna identyfikacja urządzenia między restartami mostka.
       if (attrId == BridgedDeviceBasicInformation::Attributes::UniqueID::Id) {
         uint8_t len = 0;
         while (len < MB_MAX_NAME_LEN && _desc.name[len]) len++;
         *val = esp_matter_char_str(const_cast<char*>(_desc.name), len);
         return ESP_OK;
       }
+      // FeatureMap and ClusterRevision for BridgedDeviceBasicInformation
       // FeatureMap i ClusterRevision dla BridgedDeviceBasicInformation
       if (attrId == 0xFFFC) { *val = esp_matter_uint32(0); return ESP_OK; }
       if (attrId == 0xFFFD) { *val = esp_matter_uint16(2); return ESP_OK; }
@@ -224,6 +248,7 @@ public:
   }
 
   // --------------------------------------------------------
+  //  tick – GPIO debouncing + state update
   //  tick – GPIO debouncing + aktualizacja stanu
   // --------------------------------------------------------
   bool tick() {
@@ -248,6 +273,7 @@ public:
     return true;
   }
 
+  // Manual update without GPIO
   // Ręczna aktualizacja bez GPIO
   bool setState(bool state) {
     if (!_active || state == _lastState) return false;
@@ -258,6 +284,7 @@ public:
   }
 
   // --------------------------------------------------------
+  //  Getters / setters
   //  Gettery / settery
   // --------------------------------------------------------
   bool            getState()       const { return _lastState; }
@@ -289,6 +316,13 @@ protected:
   virtual esp_matter::endpoint_t* _buildEndpoint(esp_matter::node_t* node) = 0;
 
   // --------------------------------------------------------
+  //  _addBridgedBasicInfo – adds the BridgedDeviceBasicInformation cluster
+  //
+  //  FIX: after the cluster's create() we add the UniqueID attribute (0x0009).
+  //  It is required by the Matter spec for bridged devices – it lets the hub
+  //  unambiguously identify the device across bridge reboots.
+  //  Without it the hub logs error 0x586 (EMBER_ZCL_STATUS_UNSUPPORTED_ATTRIBUTE).
+  //
   //  _addBridgedBasicInfo – dodaje klaster BridgedDeviceBasicInformation
   //
   //  POPRAWKA: po create() klastra dodajemy atrybut UniqueID (0x0009).
@@ -306,6 +340,11 @@ protected:
       return false;
     }
 
+    // FIX: the Matter stack checks whether the attribute exists in the endpoint BEFORE
+    // it calls onAttrRead(). Without an explicit attribute::create() a query for SoftwareVersion
+    // (0x0009) or UniqueID (0x0010) is rejected with err=586
+    // (EMBER_ZCL_STATUS_UNSUPPORTED_ATTRIBUTE) – hence the many errors in the log during commissioning.
+    // Flag 0x01 = the same one used by the rest of the code in the project (esp_matter attribute flags).
     // POPRAWKA: Stos Matter sprawdza czy atrybut istnieje w endpoincie ZANIM
     // wywoła onAttrRead(). Bez jawnego attribute::create() zapytanie o SoftwareVersion
     // (0x0009) lub UniqueID (0x0010) jest odrzucane z err=586
@@ -323,7 +362,7 @@ protected:
       }
     }
 
-    // UniqueID (0x0010) – jednoznaczna identyfikacja urządzenia między restartami mostka
+    // UniqueID (0x0010) – unambiguous device identification across bridge reboots / jednoznaczna identyfikacja urządzenia między restartami mostka
     {
       using namespace chip::app::Clusters::BridgedDeviceBasicInformation;
       uint8_t len = 0;
@@ -340,6 +379,7 @@ protected:
     return true;
   }
 
+  // Set the NodeLabel visible in the hub
   // Ustaw NodeLabel widoczną w hubie
   void _setNodeLabel(const char* name) {
     if (!_endpoint) return;

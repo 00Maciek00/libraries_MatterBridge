@@ -27,6 +27,7 @@
 #include "MatterBridge.h"
 
 // ============================================================
+//  MatterBridge.cpp – implementation
 //  MatterBridge.cpp – implementacja
 // ============================================================
 
@@ -40,20 +41,21 @@ static esp_err_t _globalAttrWrite(uint16_t epId, uint32_t cId, uint32_t aId,
 }
 
 // ============================================================
-//  Konstruktor
+//  Constructor / Konstruktor
 // ============================================================
 MatterBridgeClass::MatterBridgeClass()
   : _bootHeldSince(0), _globalCallback(nullptr),
     _started(false), _useNVS(true) {}
 
 // ============================================================
-//  setRuntimeNVS – wywołaj PRZED begin()
+//  setRuntimeNVS – call BEFORE begin() / wywołaj PRZED begin()
 // ============================================================
 void MatterBridgeClass::setRuntimeNVS(bool use) {
   _useNVS = use;
 }
 
 // ============================================================
+//  begin() – node + aggregator + NVS + endpoints
 //  begin() – węzeł + agregator + NVS + endpointy
 // ============================================================
 bool MatterBridgeClass::begin() {
@@ -75,7 +77,7 @@ bool MatterBridgeClass::begin() {
 }
 
 // ============================================================
-//  start() – uruchom stos Matter
+//  start() – start the Matter stack / uruchom stos Matter
 // ============================================================
 bool MatterBridgeClass::start() {
   esp_err_t err = MBNode.start();
@@ -93,6 +95,9 @@ bool MatterBridgeClass::start() {
 // ============================================================
 void MatterBridgeClass::onChange(MBCallback cb) {
   _globalCallback = cb;
+  // Iterate over MB_SLOTS (not MB_MAX_DEVICES) – channel-1 slots of 2-channel
+  // devices live in MB_MAX_DEVICES..MB_SLOTS-1 and must get the callback too
+  // (e.g. OnOffPlug channel 1 has to report changes).
   // Iteruj przez MB_SLOTS (nie MB_MAX_DEVICES) – sloty kanału 1 urządzeń
   // 2-kanałowych siedzą w przedziale MB_MAX_DEVICES..MB_SLOTS-1 i też
   // muszą dostać callback (np. OnOffPlug kanał 1 musi raportować zmiany).
@@ -119,6 +124,16 @@ void MatterBridgeClass::_buildFromStorage() {
 
 // ============================================================
 //  _constructAndRegister
+//
+//  FIX: notifyTopologyChange() is called ONLY when the Matter stack is
+//  already running (_started=true).
+//
+//  Before start() (e.g. addRuntime in setup()) attribute::update() inside
+//  notifyTopologyChange() tries to post to the Matter task queue, which
+//  does not exist yet → assert(pxQueue != NULL) → crash.
+//
+//  After start() the call is safe and needed so that the hub
+//  sees dynamically added endpoints.
 //
 //  POPRAWKA: notifyTopologyChange() jest wołane TYLKO gdy stos
 //  Matter jest już uruchomiony (_started=true).
@@ -154,6 +169,7 @@ uint8_t MatterBridgeClass::_constructAndRegister(const MBDescriptor& desc,
            runtime ? "Runtime" : "Static",
            slot, dev->getEndpointId(), desc.name);
 
+  // Notify the hub about the topology change – only when the Matter stack is running.
   // Powiadom hub o zmianie topologii – tylko gdy stos Matter już działa.
   if (_started && runtime) {
     MBNode.notifyTopologyChange();
@@ -162,8 +178,12 @@ uint8_t MatterBridgeClass::_constructAndRegister(const MBDescriptor& desc,
   return slot;
 }
 
+// ADDED: _constructAndRegister variant with a fixed slot
 // DODANE: wersja _constructAndRegister z ustalonym slotem
 uint8_t MatterBridgeClass::_constructAndRegisterAt(uint8_t slot, const MBDescriptor& desc, bool runtime) {
+    // Range check against MB_SLOTS (not MB_MAX_DEVICES) – channel-1 slots of
+    // 2-channel devices lie in MB_MAX_DEVICES..MB_SLOTS-1, e.g. slot=21 for
+    // baseIdx=1 ch1. MBSlotManager.constructAt() also checks MB_SLOTS – consistent.
     // Sprawdzenie zakresu względem MB_SLOTS (nie MB_MAX_DEVICES) –
     // sloty kanału 1 urządzeń 2-kanałowych leżą w przedziale
     // MB_MAX_DEVICES..MB_SLOTS-1, np. slot=21 dla baseIdx=1 ch1.
@@ -173,7 +193,7 @@ uint8_t MatterBridgeClass::_constructAndRegisterAt(uint8_t slot, const MBDescrip
         return MB_INVALID_SLOT;
     }
 
-    // Konstruujemy bezpośrednio w podanym slocie
+    // Construct directly in the given slot / Konstruujemy bezpośrednio w podanym slocie
     if (_slots.constructAt(slot, desc) != slot) {
         ESP_LOGE("MatterBridge", "_constructAndRegisterAt: constructAt nie powiódł się dla slotu %u", slot);
         return MB_INVALID_SLOT;
@@ -199,7 +219,7 @@ uint8_t MatterBridgeClass::_constructAndRegisterAt(uint8_t slot, const MBDescrip
 }
 
 // ============================================================
-//  TRYB STATYCZNY – NVS + restart
+//  STATIC MODE – NVS + restart / TRYB STATYCZNY – NVS + restart
 // ============================================================
 uint8_t MatterBridgeClass::add(const MBDescriptor& desc) {
   if (!_storage.append(desc)) {
@@ -240,10 +260,21 @@ bool MatterBridgeClass::remove(uint8_t slot) {
 }
 
 // ============================================================
+//  RUNTIME MODE – no restart
+//
+//  NVS FIX: when _useNVS=false we do not write to NVS. Devices are created
+//  in every setup(). Writing to NVS would cause duplicates after a clean reboot:
+//    boot 1: NVS empty → setup() adds 2 devices → saved to NVS
+//    boot 2: _buildFromStorage creates 2 from NVS → setup() adds 2 more = 4
+//
+//  notifyTopologyChange FIX: _constructAndRegister does not call
+//  notifyTopologyChange() before _started (before start()).
+//
 //  TRYB RUNTIME – bez restartu
 //
-//  POPRAWKA NVS: gdy _useNVS=false, nie zapisujemy
-//  do NVS. Urządzenia są tworzone przy każdym starcie w setup(). Zapis do NVS powodowałby duplikaty po czystym restarcie:
+//  POPRAWKA NVS: gdy _useNVS=false, nie zapisujemy do NVS. Urządzenia są
+//  tworzone przy każdym starcie w setup(). Zapis do NVS powodowałby
+//  duplikaty po czystym restarcie:
 //    boot 1: NVS puste → setup() dodaje 2 urządzenia → zapisuje do NVS
 //    boot 2: _buildFromStorage tworzy 2 z NVS → setup() dodaje 2 więcej = 4
 //
@@ -262,7 +293,7 @@ uint8_t MatterBridgeClass::addRuntime(const MBDescriptor& desc) {
   uint8_t slot = _constructAndRegister(desc, /*runtime=*/true);
   if (slot == MB_INVALID_SLOT) {
     if (_useNVS) {
-      // Cofnij NVS przy błędzie rejestracji
+      // Roll back NVS on registration failure / Cofnij NVS przy błędzie rejestracji
       _storage.remove(_storage.count() - 1);
       _storage.save();
     }
@@ -271,8 +302,11 @@ uint8_t MatterBridgeClass::addRuntime(const MBDescriptor& desc) {
   return slot;
 }
 
+// ADDED: addRuntimeAt – variant with a forced slot
 // DODANE: addRuntimeAt – wersja z wymuszonym slotem
 uint8_t MatterBridgeClass::addRuntimeAt(uint8_t preferredSlot, const MBDescriptor& desc) {
+    // With setRuntimeNVS(false) NVS is off – nothing is saved.
+    // If NVS is enabled anyway, the descriptor is saved (but the slot is not guaranteed).
     // Przy setRuntimeNVS(false) NVS jest wyłączone – nie zapisujemy.
     // Jeśli jednak ktoś włączył NVS, to zapisujemy deskryptor (ale bez gwarancji slotu)
     if (_useNVS) {
@@ -286,7 +320,7 @@ uint8_t MatterBridgeClass::addRuntimeAt(uint8_t preferredSlot, const MBDescripto
     uint8_t slot = _constructAndRegisterAt(preferredSlot, desc, /*runtime=*/true);
     if (slot == MB_INVALID_SLOT) {
         if (_useNVS) {
-            // Cofnij dodanie do NVS
+            // Roll back the NVS entry / Cofnij dodanie do NVS
             _storage.remove(_storage.count() - 1);
             _storage.save();
         }
@@ -320,26 +354,32 @@ bool MatterBridgeClass::removeRuntime(uint8_t slot) {
 
   uint16_t epId = dev->getEndpointId();
 
+  // Step 1: mark as unreachable (chip_stack_lock inside setReachable)
   // Krok 1: oznacz jako nieosiągalny (chip_stack_lock wewnątrz setReachable)
   MBNode.setReachable(epId, false);
+  // We do not block loop() with delay() – the hub learns about the removal
+  // through notifyTopologyChange() below anyway.
   // Nie blokujemy loop delay() – hub i tak dowie się o usunięciu przez
   // notifyTopologyChange() poniżej.
 
+  // Step 2: destroy the endpoint in the stack (chip_stack_lock is in unregisterFrom)
   // Krok 2: zniszcz endpoint w stosie (chip_stack_lock jest w unregisterFrom)
   if (!dev->unregisterFrom(MBNode.node())) {
     ESP_LOGW("MatterBridge", "removeRuntime: destroy ep=%u FAILED", epId);
   }
 
+  // Step 3: remove from NVS (only when _useNVS)
   // Krok 3: usuń z NVS (tylko gdy _useNVS)
   if (_useNVS) {
     uint8_t si = _findStorageIndex(nameBuf);
     if (si != MB_INVALID_SLOT) { _storage.remove(si); _storage.save(); }
   }
 
-  // Krok 4: zniszcz obiekt
+  // Step 4: destroy the object / Krok 4: zniszcz obiekt
   _slots.destroy(slot);
   ESP_LOGI("MatterBridge", "removeRuntime: slot=%d '%s' OK", slot, nameBuf);
 
+  // Notify the hub about the topology change – only when the Matter stack is running.
   // Powiadom hub o zmianie topologii – tylko gdy stos Matter już działa.
   if (_started) {
     MBNode.notifyTopologyChange();
@@ -357,7 +397,7 @@ bool MatterBridgeClass::setVisible(uint8_t slot, bool visible) {
 }
 
 // ============================================================
-//  Sterowanie i odczyt
+//  Control and read-out / Sterowanie i odczyt
 // ============================================================
 void MatterBridgeClass::setState(uint8_t slot, bool state) {
   MBDevice* dev = _slots.get(slot);
@@ -384,6 +424,8 @@ MBDevice* MatterBridgeClass::device(uint8_t slot) {
 }
 
 void MatterBridgeClass::update() {
+  // MB_SLOTS covers channel-1 slots (MB_MAX_DEVICES..MB_SLOTS-1) –
+  // their tick() must run so that GPIO and timers work correctly.
   // MB_SLOTS obejmuje sloty kanału 1 (MB_MAX_DEVICES..MB_SLOTS-1) –
   // ich tick() musi być wywołany żeby GPIO i timery działały poprawnie.
   for (uint8_t i = 0; i < MB_SLOTS; i++) {
@@ -404,10 +446,12 @@ void MatterBridgeClass::checkBoot(uint8_t pin, uint32_t holdMs) {
 }
 
 // ============================================================
-//  Diagnostyka
+//  Diagnostics / Diagnostyka
 // ============================================================
 uint8_t MatterBridgeClass::activeCount() const {
   uint8_t n = 0;
+  // MB_SLOTS – count active devices in all slots, including channel 1 of
+  // 2-channel devices (slots MB_MAX_DEVICES..MB_SLOTS-1).
   // MB_SLOTS – liczymy aktywne urządzenia we wszystkich slotach łącznie
   // z kanałem 1 urządzeń 2-kanałowych (sloty MB_MAX_DEVICES..MB_SLOTS-1).
   for (uint8_t i = 0; i < MB_SLOTS; i++) {
@@ -420,6 +464,8 @@ uint8_t MatterBridgeClass::registeredCount() const {
   return _slots.occupiedCount();
 }
 void MatterBridgeClass::printStatus() const {
+  // MB_MAX_DEVICES = number of physical devices (not Matter slots).
+  // MB_SLOTS = physical size of the table (MB_MAX_DEVICES * 2).
   // MB_MAX_DEVICES = liczba urządzeń fizycznych (nie slotów Matter).
   // MB_SLOTS = fizyczny rozmiar tablicy (MB_MAX_DEVICES * 2).
   Serial.printf("[MatterBridge] %d/%d urządzeń (sloty Matter: %d/%d), komisjonowany=%d\n",
@@ -437,7 +483,7 @@ void MatterBridgeClass::printStatus() const {
 }
 
 // ============================================================
-//  Komisjonowanie
+//  Commissioning / Komisjonowanie
 // ============================================================
 bool MatterBridgeClass::isCommissioned() const { return MBNode.isCommissioned(); }
 bool MatterBridgeClass::getPairingCode(char* buf, size_t len) const { return MBNode.getPairingCode(buf, len); }
@@ -456,7 +502,7 @@ void MatterBridgeClass::factoryReset() {
 }
 
 // ============================================================
-//  Callbacki atrybutów
+//  Attribute callbacks / Callbacki atrybutów
 // ============================================================
 esp_err_t MatterBridgeClass::onAttrRead(uint16_t epId, uint32_t cId,
                                          uint32_t aId,
@@ -475,7 +521,7 @@ esp_err_t MatterBridgeClass::onAttrWrite(uint16_t epId, uint32_t cId,
 }
 
 // ============================================================
-//  Prywatne
+//  Private / Prywatne
 // ============================================================
 uint8_t MatterBridgeClass::_findStorageIndex(const char* name) const {
   for (uint8_t i = 0; i < _storage.count(); i++) {
@@ -490,6 +536,6 @@ uint8_t MatterBridgeClass::_findStorageIndex(const char* name) const {
   return MB_INVALID_SLOT;
 }
 
-// Singletony
+// Singletons / Singletony
 MatterBridgeClass MatterBridge;
 MBNodeClass       MBNode;

@@ -28,6 +28,16 @@
 #include "MBDevices.h"
 
 // ============================================================
+//  MBDeviceFactory.h – device factory (placement new, zero heap)
+//
+//  MBDeviceBuffer – an aligned buffer for the largest possible object.
+//  MBDeviceFactory::create() – constructs in-place, returns MBDevice*.
+//  MBDeviceFactory::destroy() – calls the destructor, does not free memory.
+//
+//  To add a new type:
+//    1. Add a field to MBDeviceUnion
+//    2. Add a case in MBDeviceFactory::create()
+//
 //  MBDeviceFactory.h – fabryka urządzeń (placement new, zero heap)
 //
 //  MBDeviceBuffer – wyrównany bufor na największy możliwy obiekt.
@@ -39,6 +49,7 @@
 //    2. Dodaj case w MBDeviceFactory::create()
 // ============================================================
 
+// Union used to determine the buffer size and alignment
 // Unia do wyznaczenia rozmiaru i wyrównania bufora
 union MBDeviceUnion {
   MBContactSensor   _contact;
@@ -52,7 +63,7 @@ union MBDeviceUnion {
   MBColorTempLight  _colorTemp;
   MBFan             _fan;
   MBWindowCovering  _covering;
-  MBElectricalPlug  _electrical;  // NOWA KLASA
+  MBElectricalPlug  _electrical;  // NEW CLASS / NOWA KLASA
   MBTempHumidSensor _tempHumid;
 };
 
@@ -76,7 +87,7 @@ public:
       case MBDeviceType::ColorTempLight:   return new (p) MBColorTempLight(desc);
       case MBDeviceType::Fan:              return new (p) MBFan(desc);
       case MBDeviceType::WindowCovering:   return new (p) MBWindowCovering(desc);
-      case MBDeviceType::ElectricalSensor: return new (p) MBElectricalPlug(desc);  // NOWA KLASA
+      case MBDeviceType::ElectricalSensor: return new (p) MBElectricalPlug(desc);  // NEW CLASS / NOWA KLASA
       case MBDeviceType::TempHumidSensor:  return new (p) MBTempHumidSensor(desc);
       default: return nullptr;
     }

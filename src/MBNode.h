@@ -46,9 +46,14 @@
 #include <platform/CommissionableDataProvider.h>
 #include <platform/PlatformManager.h>
 
+// CHIP reporting – needed for MatterReportingAttributeChangeCallback
 // CHIP reporting – potrzebne do MatterReportingAttributeChangeCallback
 #include <app/reporting/reporting.h>
 
+// ── OpenThread – required ONLY on ESP32-C6 ─────────────────────────────────
+// On ESP32-S3 OpenThread does not exist in the SDK – including the headers
+// would cause a compile error. On C6 arduino-esp32 3.x always links
+// OpenThread and requires set_openthread_platform_config() to be called before start().
 // ── OpenThread – wymagany TYLKO na ESP32-C6 ───────────────────────────────────
 // Na ESP32-S3 OpenThread nie istnieje w SDK – dołączenie nagłówków
 // spowodowałoby błąd kompilacji. Na C6 arduino-esp32 3.x zawsze linkuje
@@ -66,6 +71,7 @@ using esp_matter::CLUSTER_FLAG_SERVER;
 using esp_matter::CLUSTER_FLAG_ATTRIBUTE_CHANGED_FUNCTION;
 
 // ============================================================
+//  MBNode.h – Matter node initialisation via esp-matter
 //  MBNode.h – inicjalizacja węzła Matter przez esp-matter
 // ============================================================
 
@@ -89,6 +95,7 @@ public:
   }
 
   // --------------------------------------------------------
+  //  init() – NVS + Matter node + aggregator EP1
   //  init() – NVS + węzeł Matter + agregator EP1
   // --------------------------------------------------------
   bool init(MBAttrReadCb readCb, MBAttrWriteCb writeCb) {
@@ -122,6 +129,13 @@ public:
   // --------------------------------------------------------
   //  start()
   //
+  //  KEY DIFFERENCE C6 vs S3:
+  //    C6: arduino-esp32 3.x always links OpenThread – we must call
+  //        set_openthread_platform_config() even when using WiFi.
+  //        Skipping it causes an assert/crash in start().
+  //    S3: OpenThread does not exist in the SDK – we call nothing.
+  //        esp_matter::start() handles WiFi without OpenThread.
+  //
   //  KLUCZOWA RÓŻNICA C6 vs S3:
   //    C6: arduino-esp32 3.x zawsze linkuje OpenThread – musimy wywołać
   //        set_openthread_platform_config() nawet gdy używamy WiFi.
@@ -132,6 +146,8 @@ public:
   esp_err_t start() {
 
 #if MB_TARGET_C6
+    // OpenThread configuration – required by arduino-esp32 3.x on C6.
+    // Even in WiFi mode it must be called before start().
     // Konfiguracja OpenThread – wymagana przez arduino-esp32 3.x na C6.
     // Nawet w trybie WiFi musi być wywołana przed start().
     esp_openthread_platform_config_t otCfg;
@@ -150,6 +166,7 @@ public:
     }
     ESP_LOGI("MBNode", "OpenThread platform config OK (C6, tryb WiFi)");
 #else
+    // S3: OpenThread is unavailable, esp_matter::start() works over WiFi
     // S3: OpenThread niedostępny, esp_matter::start() działa przez WiFi
     ESP_LOGI("MBNode", "Pominięto OpenThread (S3 – brak radia Thread)");
     esp_err_t err = ESP_OK;
@@ -200,6 +217,17 @@ public:
   }
 
   // --------------------------------------------------------
+  //  notifyTopologyChange – informs the hub about a change of the endpoint list.
+  //
+  //  CRITICAL FIX: the old code used the pattern:
+  //    attribute::get_val(attr, &val);   // val points to an internal buffer
+  //    attribute::update(epId, ...&val); // esp-matter tries to free the old
+  //                                        buffer – which we have just returned!
+  //  Result: double-free → CORRUPT HEAP.
+  //
+  //  Correct solution: MatterReportingAttributeChangeCallback(epId, cId, aId)
+  //  marks the attribute as dirty directly in the CHIP reporting engine.
+  //
   //  notifyTopologyChange – informuje hub o zmianie listy endpointów.
   //
   //  POPRAWKA KRYTYCZNA: stary kod używał wzorca:
@@ -235,6 +263,7 @@ public:
   }
 
   // --------------------------------------------------------
+  //  setReachable – sets the Reachable attribute on an endpoint.
   //  setReachable – ustawia atrybut Reachable na endpoincie.
   // --------------------------------------------------------
   bool setReachable(uint16_t epId, bool reachable) {
