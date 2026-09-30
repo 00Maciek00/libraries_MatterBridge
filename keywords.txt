@@ -1,0 +1,86 @@
+#######################################
+# Syntax Coloring Map — MatterBridge
+# S.M. DIY Home
+#######################################
+
+#######################################
+# Datatypes (KEYWORD1)
+#######################################
+
+MatterBridgeClass	KEYWORD1
+MatterBridge	KEYWORD1
+MBDevice	KEYWORD1
+MBDescriptor	KEYWORD1
+MBDeviceType	KEYWORD1
+MBTempHumidSensor	KEYWORD1
+MBSwitch	KEYWORD1
+MBElectricalPlug	KEYWORD1
+MBCallback	KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+
+begin	KEYWORD2
+start	KEYWORD2
+update	KEYWORD2
+checkBoot	KEYWORD2
+onChange	KEYWORD2
+setRuntimeNVS	KEYWORD2
+addRuntime	KEYWORD2
+addRuntimeAt	KEYWORD2
+removeRuntime	KEYWORD2
+add	KEYWORD2
+remove	KEYWORD2
+setState	KEYWORD2
+getState	KEYWORD2
+setVisible	KEYWORD2
+setActive	KEYWORD2
+isActive	KEYWORD2
+device	KEYWORD2
+printStatus	KEYWORD2
+isCommissioned	KEYWORD2
+getPairingCode	KEYWORD2
+getQRCode	KEYWORD2
+decommission	KEYWORD2
+factoryReset	KEYWORD2
+setTemperature	KEYWORD2
+setHumidity	KEYWORD2
+setLevel	KEYWORD2
+setColorTemp	KEYWORD2
+setFanMode	KEYWORD2
+setPosition	KEYWORD2
+setVoltage	KEYWORD2
+setCurrent	KEYWORD2
+setActivePower	KEYWORD2
+setEnergy	KEYWORD2
+sendMultiPress	KEYWORD2
+sendLongPress	KEYWORD2
+
+#######################################
+# Constants (LITERAL1)
+#######################################
+
+MB_INVALID_SLOT	LITERAL1
+MB_NO_PIN	LITERAL1
+MB_MAX_DEVICES	LITERAL1
+MB_SLOTS	LITERAL1
+MB_BOOT_PIN	LITERAL1
+MB_DEBOUNCE_MS	LITERAL1
+MB_MAX_NAME_LEN	LITERAL1
+MB_USE_PSRAM	LITERAL1
+MB_VENDOR_ID	LITERAL1
+MB_PRODUCT_ID	LITERAL1
+ContactSensor	LITERAL1
+PresenceSensor	LITERAL1
+Switch	LITERAL1
+TemperatureSensor	LITERAL1
+HumiditySensor	LITERAL1
+OnOffLight	LITERAL1
+DimmableLight	LITERAL1
+ColorTempLight	LITERAL1
+OnOffPlug	LITERAL1
+Fan	LITERAL1
+WindowCovering	LITERAL1
+ElectricalSensor	LITERAL1
+TempHumidSensor	LITERAL1
